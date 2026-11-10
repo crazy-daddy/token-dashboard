@@ -15,7 +15,7 @@ from .db import (
     tool_token_breakdown, recent_sessions, session_turns,
     daily_token_breakdown, model_breakdown, skill_breakdown,
 )
-from .pricing import load_pricing, cost_for, get_plan, set_plan
+from .pricing import load_pricing, cost_for, get_plan, set_plan, long_context_thresholds
 from .tips import all_tips, dismiss_tip
 from .scanner import scan_dir
 from .skills import cached_catalog
@@ -65,7 +65,10 @@ def _serve_static(handler, rel: str) -> None:
     handler.send_header("Content-Type", ctype or "application/octet-stream")
     handler.send_header("Content-Length", str(len(body)))
     handler.end_headers()
-    handler.wfile.write(body)
+    try:
+        handler.wfile.write(body)
+    except OSError:
+        pass  # client went away
 
 
 def build_handler(db_path: str, projects_dir: str):
@@ -91,7 +94,7 @@ def build_handler(db_path: str, projects_dir: str):
             if path == "/api/overview":
                 totals = overview_totals(db_path, since, until)
                 cost_usd = 0.0
-                for m in model_breakdown(db_path, since, until):
+                for m in model_breakdown(db_path, since, until, long_context_thresholds(pricing)):
                     c = cost_for(m["model"], m, pricing)
                     if c["usd"] is not None:
                         cost_usd += c["usd"]
@@ -128,7 +131,7 @@ def build_handler(db_path: str, projects_dir: str):
                     r["tokens_per_call"] = info["tokens"] if info else None
                 return _send_json(self, rows)
             if path == "/api/by-model":
-                rows = model_breakdown(db_path, since, until)
+                rows = model_breakdown(db_path, since, until, long_context_thresholds(pricing))
                 for r in rows:
                     c = cost_for(r["model"], r, pricing)
                     r["cost_usd"] = c["usd"]
@@ -159,7 +162,7 @@ def build_handler(db_path: str, projects_dir: str):
                     try:
                         self.wfile.write(chunk)
                         self.wfile.flush()
-                    except (BrokenPipeError, ConnectionResetError):
+                    except OSError:  # client gone: BrokenPipe, Reset, Aborted (WinError 10053)
                         return
             self.send_response(404)
             self.end_headers()

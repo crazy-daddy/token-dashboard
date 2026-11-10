@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
-from .db import connect
+from .db import connect, parent_project_slug
 
 
 INSERT_MSG = """
@@ -163,7 +163,7 @@ def parse_record(rec: dict, project_slug: str) -> Tuple[dict, List[dict]]:
 
 def _project_slug(file_path: Path, projects_root: Path) -> str:
     rel = file_path.relative_to(projects_root)
-    return rel.parts[0]
+    return parent_project_slug(rel.parts[0])
 
 
 def _evict_prior_snapshots(conn, session_id: str, message_id: str, keep_uuid: str) -> None:
