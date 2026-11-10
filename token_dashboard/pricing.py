@@ -14,14 +14,37 @@ def load_pricing(path: Union[str, Path]) -> dict:
 
 def _tier_from_name(model: str) -> Optional[str]:
     m = (model or "").lower()
-    for tier in ("opus", "sonnet", "haiku"):
+    for tier in ("fable", "mythos", "opus", "sonnet", "haiku"):
         if tier in m:
             return tier
     return None
 
 
+_RATE_KEYS = {
+    "input":           "input_tokens",
+    "output":          "output_tokens",
+    "cache_read":      "cache_read_tokens",
+    "cache_create_5m": "cache_create_5m_tokens",
+    "cache_create_1h": "cache_create_1h_tokens",
+}
+
+
+def long_context_thresholds(pricing: dict) -> dict:
+    """{model: prompt-token limit} for models priced higher above that limit."""
+    return {
+        model: rates["long_context"]["above"]
+        for model, rates in pricing["models"].items()
+        if "long_context" in rates
+    }
+
+
 def cost_for(model: str, usage: dict, pricing: dict) -> dict:
-    """Return {usd, estimated, breakdown}. usd=None when no tier match."""
+    """Return {usd, estimated, breakdown}. usd=None when no tier match.
+
+    When the model has `long_context` rates and `usage` carries `long_<col>`
+    sums (see db.model_breakdown), those tokens bill at the long-context
+    rates and the rest at base rates.
+    """
     rates = pricing["models"].get(model)
     estimated = False
     if rates is None:
@@ -31,13 +54,14 @@ def cost_for(model: str, usage: dict, pricing: dict) -> dict:
             estimated = True
         else:
             return {"usd": None, "estimated": True, "breakdown": {}}
-    bd = {
-        "input":           usage["input_tokens"]            * rates["input"]           / 1_000_000,
-        "output":          usage["output_tokens"]           * rates["output"]          / 1_000_000,
-        "cache_read":      usage["cache_read_tokens"]       * rates["cache_read"]      / 1_000_000,
-        "cache_create_5m": usage["cache_create_5m_tokens"]  * rates["cache_create_5m"] / 1_000_000,
-        "cache_create_1h": usage["cache_create_1h_tokens"]  * rates["cache_create_1h"] / 1_000_000,
-    }
+    long_rates = rates.get("long_context")
+    bd = {}
+    for rate_key, col in _RATE_KEYS.items():
+        long_tokens = usage.get("long_" + col, 0) if long_rates else 0
+        bd[rate_key] = (
+            (usage[col] - long_tokens) * rates[rate_key]
+            + long_tokens * (long_rates[rate_key] if long_rates else 0)
+        ) / 1_000_000
     return {"usd": round(sum(bd.values()), 6), "estimated": estimated, "breakdown": bd}
 
 

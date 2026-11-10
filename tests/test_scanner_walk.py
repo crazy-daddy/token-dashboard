@@ -31,6 +31,38 @@ class WalkTests(unittest.TestCase):
             row = c.execute("SELECT project_slug FROM messages WHERE uuid='u1'").fetchone()
         self.assertEqual(row[0], "C--work-sample")
 
+    def test_worktree_sessions_fold_into_parent_project(self):
+        wt_dir = os.path.join(self.proj_root, "C--work-sample--claude-worktrees-cse-abc")
+        os.makedirs(wt_dir)
+        with open(os.path.join(wt_dir, "s2.jsonl"), "w", encoding="utf-8") as f:
+            f.write('{"type":"assistant","uuid":"w1","sessionId":"s2","timestamp":"2026-04-10T00:00:05Z","isSidechain":false,"message":{"model":"claude-haiku-4-5","usage":{"input_tokens":1,"output_tokens":1}}}\n')
+        scan_dir(self.proj_root, self.db)
+        with sqlite3.connect(self.db) as c:
+            slugs = {r[0] for r in c.execute("SELECT DISTINCT project_slug FROM messages")}
+        self.assertEqual(slugs, {"C--work-sample"})
+
+    def test_parent_project_slug_handles_git_worktrees_and_drive_roots(self):
+        from token_dashboard.db import parent_project_slug
+        self.assertEqual(parent_project_slug("-home-alice-repo--worktrees-phase1"), "-home-alice-repo")
+        self.assertEqual(parent_project_slug("C--work-repo--claude-worktrees-x"), "C--work-repo")
+        # C:\worktrees-x is a real project, not a worktree of "C".
+        self.assertEqual(parent_project_slug("C--worktrees-x"), "C--worktrees-x")
+
+    def test_init_db_folds_existing_worktree_rows(self):
+        with sqlite3.connect(self.db) as c:
+            c.execute(
+                "INSERT INTO messages (uuid, session_id, project_slug, type, timestamp) "
+                "VALUES ('x1','s9','C--work-sample--claude-worktrees-cse-abc','user','2026-04-10T00:00:00Z')"
+            )
+            c.execute(
+                "INSERT INTO tool_calls (message_uuid, session_id, project_slug, tool_name, timestamp) "
+                "VALUES ('x1','s9','C--work-sample--claude-worktrees-cse-abc','Read','2026-04-10T00:00:00Z')"
+            )
+        init_db(self.db)
+        with sqlite3.connect(self.db) as c:
+            self.assertEqual(c.execute("SELECT project_slug FROM messages WHERE uuid='x1'").fetchone()[0], "C--work-sample")
+            self.assertEqual(c.execute("SELECT project_slug FROM tool_calls WHERE message_uuid='x1'").fetchone()[0], "C--work-sample")
+
     def test_rescan_skips_unchanged_files(self):
         n1 = scan_dir(self.proj_root, self.db)
         n2 = scan_dir(self.proj_root, self.db)

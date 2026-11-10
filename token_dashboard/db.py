@@ -1,6 +1,7 @@
 """SQLite schema, connection, and shared query helpers."""
 from __future__ import annotations
 
+import json
 import os
 import re
 import sqlite3
@@ -85,6 +86,41 @@ def init_db(path: Union[str, Path]) -> None:
     with sqlite3.connect(path) as c:
         _migrate_add_message_id(c)
         c.executescript(SCHEMA)
+        _fold_worktree_slugs(c)
+
+
+# Worktrees live at <repo>/.claude/worktrees/<name> (Claude Code) or
+# <repo>/.worktrees/<name> (common git convention); the slug encoding turns
+# those path segments into these markers.
+WORKTREE_MARKERS = ("--claude-worktrees-", "--worktrees-")
+
+
+def parent_project_slug(slug: str) -> str:
+    """Map a worktree slug onto its parent repo's slug; other slugs unchanged."""
+    hits = [i for i in (slug.find(m) for m in WORKTREE_MARKERS) if i >= 0]
+    if not hits:
+        return slug
+    parent = slug[:min(hits)]
+    # A bare drive letter means the marker came from "C:\" itself
+    # (e.g. C:\worktrees-x), not from a worktree under a repo.
+    if not parent or re.fullmatch(r"[A-Za-z]", parent):
+        return slug
+    return parent
+
+
+def _fold_worktree_slugs(conn) -> None:
+    """Rewrite rows scanned before worktree folding existed. Idempotent."""
+    for table in ("messages", "tool_calls"):
+        slugs = [r[0] for r in conn.execute(
+            f"SELECT DISTINCT project_slug FROM {table} WHERE project_slug LIKE '%-worktrees-%'"
+        )]
+        for slug in slugs:
+            parent = parent_project_slug(slug)
+            if parent != slug:
+                conn.execute(
+                    f"UPDATE {table} SET project_slug=? WHERE project_slug=?", (parent, slug)
+                )
+    conn.commit()
 
 
 def _migrate_add_message_id(conn) -> None:
@@ -356,9 +392,26 @@ def skill_breakdown(db_path, since=None, until=None) -> list:
         return [dict(r) for r in c.execute(sql, args)]
 
 
-def model_breakdown(db_path, since=None, until=None) -> list:
-    """Per-model token totals + turn count. Caller computes cost via pricing."""
+_USAGE_COLS = ("input_tokens", "output_tokens", "cache_read_tokens",
+               "cache_create_5m_tokens", "cache_create_1h_tokens")
+
+
+def model_breakdown(db_path, since=None, until=None, long_context_thresholds=None) -> list:
+    """Per-model token totals + turn count. Caller computes cost via pricing.
+
+    `long_context_thresholds` maps model -> prompt-token limit. For those
+    models each row also carries `long_<col>` sums over turns whose prompt
+    (input + cache read + cache writes) exceeds the limit, so the caller can
+    bill them at long-context rates. Other models get zeros.
+    """
     rng, args = _range_clause(since, until)
+    over = (
+        "(input_tokens + cache_read_tokens + cache_create_5m_tokens + cache_create_1h_tokens)"
+        " > json_extract(?, '$.\"' || model || '\"')"
+    )
+    long_cols = ",\n".join(
+        f"COALESCE(SUM(CASE WHEN {over} THEN {c} ELSE 0 END),0) AS long_{c}" for c in _USAGE_COLS
+    )
     sql = f"""
       SELECT COALESCE(model, 'unknown') AS model,
              COUNT(*) AS turns,
@@ -366,11 +419,13 @@ def model_breakdown(db_path, since=None, until=None) -> list:
              COALESCE(SUM(output_tokens),0)           AS output_tokens,
              COALESCE(SUM(cache_read_tokens),0)       AS cache_read_tokens,
              COALESCE(SUM(cache_create_5m_tokens),0)  AS cache_create_5m_tokens,
-             COALESCE(SUM(cache_create_1h_tokens),0)  AS cache_create_1h_tokens
+             COALESCE(SUM(cache_create_1h_tokens),0)  AS cache_create_1h_tokens,
+             {long_cols}
         FROM messages
        WHERE type = 'assistant' {rng}
        GROUP BY model
        ORDER BY (input_tokens + output_tokens + cache_create_5m_tokens + cache_create_1h_tokens) DESC
     """
+    thresholds = json.dumps(long_context_thresholds or {})
     with connect(db_path) as c:
-        return [dict(r) for r in c.execute(sql, args)]
+        return [dict(r) for r in c.execute(sql, [thresholds] * len(_USAGE_COLS) + args)]
